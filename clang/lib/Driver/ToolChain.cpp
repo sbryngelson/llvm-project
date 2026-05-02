@@ -963,9 +963,11 @@ void ToolChain::addFortranRuntimeLibs(const ArgList &Args,
       CmdArgs.push_back("-lexecinfo");
   }
 
-  // libomp needs libatomic for atomic operations if using libgcc
   if (Args.hasFlag(options::OPT_fopenmp, options::OPT_fopenmp_EQ,
                    options::OPT_fno_openmp, false)) {
+    CmdArgs.push_back("-lflang_rt.openmp");
+
+    // libomp needs libatomic for atomic operations if using libgcc
     Driver::OpenMPRuntimeKind OMPRuntime = getDriver().getOpenMPRuntime(Args);
     ToolChain::RuntimeLibType RuntimeLib = GetRuntimeLibType(Args);
     if ((OMPRuntime == Driver::OMPRT_OMP &&
@@ -2022,6 +2024,14 @@ void ToolChain::TranslateXarchArgs(
     AllocatedArgs->push_back(A);
 }
 
+/// Match any triple recognized arch aliases.
+static bool isXArchCompatibleTripleArch(const llvm::Triple &TT,
+                                        StringRef XArchVal) {
+  llvm::Triple ParsedTriple(XArchVal);
+  return TT.getArch() == ParsedTriple.getArch() &&
+         TT.getSubArch() == ParsedTriple.getSubArch();
+}
+
 llvm::opt::DerivedArgList *ToolChain::TranslateXarchArgs(
     const llvm::opt::DerivedArgList &Args, StringRef BoundArch,
     Action::OffloadKind OFK,
@@ -2040,8 +2050,10 @@ llvm::opt::DerivedArgList *ToolChain::TranslateXarchArgs(
       NeedTrans = !IsDevice;
       Skip = IsDevice;
     } else if (A->getOption().matches(options::OPT_Xarch__)) {
-      NeedTrans = A->getValue() == getArchName() ||
-                  (!BoundArch.empty() && A->getValue() == BoundArch);
+      StringRef Val = A->getValue();
+      NeedTrans = Val == getArchName() ||
+                  (!BoundArch.empty() && Val == BoundArch) ||
+                  isXArchCompatibleTripleArch(Triple, Val);
       Skip = !NeedTrans;
     }
     if (NeedTrans || Skip)

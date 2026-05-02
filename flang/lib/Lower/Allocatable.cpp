@@ -18,6 +18,7 @@
 #include "flang/Lower/ConvertVariable.h"
 #include "flang/Lower/IterationSpace.h"
 #include "flang/Lower/Mangler.h"
+#include "flang/Lower/MultiImageFortran.h"
 #include "flang/Lower/OpenACC.h"
 #include "flang/Lower/PFTBuilder.h"
 #include "flang/Lower/Runtime.h"
@@ -29,6 +30,7 @@
 #include "flang/Optimizer/Dialect/CUF/CUFOps.h"
 #include "flang/Optimizer/Dialect/FIROps.h"
 #include "flang/Optimizer/Dialect/FIROpsSupport.h"
+#include "flang/Optimizer/Dialect/MIF/MIFOps.h"
 #include "flang/Optimizer/HLFIR/HLFIROps.h"
 #include "flang/Optimizer/Support/FatalError.h"
 #include "flang/Optimizer/Support/InternalNames.h"
@@ -197,18 +199,17 @@ bool isRegionNestedInOmpTarget(mlir::Region &region) {
   return false;
 }
 
-/// Generate a runtime call to set allocator idx of descriptor for target amd.
-static void genAMDRuntimeDescriptorSetAllocIdx(fir::FirOpBuilder &builder,
-                                               mlir::Location loc,
-                                               const fir::MutableBoxValue &box,
-                                               int allocatorId) {
+static void genOpenMPRuntimeDescriptorSetAllocIdx(fir::FirOpBuilder &builder,
+                                                  mlir::Location loc,
+                                                  const fir::MutableBoxValue &box,
+                                                  int allocatorId) {
   if (isRegionNestedInOmpTarget(builder.getRegion()))
     return;
   auto *context = builder.getContext();
   mlir::Type descriptorTy = box.getAddr().getType();
   mlir::IntegerType posTy = builder.getI32Type();
   mlir::func::FuncOp callee = builder.createFunction(
-      loc, RTNAME_STRING(AMDAllocatableSetAllocIdx),
+      loc, RTNAME_STRING(OpenMPAllocatableSetAllocIdx),
       mlir::FunctionType::get(context, {descriptorTy, posTy}, {}));
   llvm::SmallVector<mlir::Value> args{box.getAddr()};
   args.push_back(
@@ -371,11 +372,12 @@ private:
   struct Allocation {
     const Fortran::parser::Allocation &alloc;
     const Fortran::semantics::DeclTypeSpec &type;
-    bool hasCoarraySpec() const {
+    const std::optional<Fortran::parser::AllocateCoarraySpec> &
+    getCoarraySpec() const {
       return std::get<std::optional<Fortran::parser::AllocateCoarraySpec>>(
-                 alloc.t)
-          .has_value();
+          alloc.t);
     }
+    bool hasCoarraySpec() const { return getCoarraySpec().has_value(); }
     const Fortran::parser::AllocateObject &getAllocObj() const {
       return std::get<Fortran::parser::AllocateObject>(alloc.t);
     }
@@ -524,10 +526,10 @@ private:
                             !box.isPointer();
     unsigned allocatorIdx = Fortran::lower::getAllocatorIdx(alloc.getSymbol());
     const auto &langFeatures = converter.getFoldingContext().languageFeatures();
-    bool isAMDMemoryAllocatorEnabled = langFeatures.IsEnabled(
-        Fortran::common::LanguageFeature::AmdMemoryAllocator);
+    bool isOpenMPAllocatorEnabled = langFeatures.IsEnabled(
+        Fortran::common::LanguageFeature::OpenMPDefaultAllocator);
 
-    if (inlineAllocation &&
+    if (inlineAllocation && !alloc.hasCoarraySpec() &&
         ((isCudaAllocate && isCudaDeviceContext) || !isCudaAllocate)) {
       // Pointers must use PointerAllocate so that their deallocations
       // can be validated.
@@ -550,16 +552,18 @@ private:
     // Generate a sequence of runtime calls.
     errorManager.genStatCheck(builder, loc);
     genAllocateObjectInit(box, allocatorIdx);
-    if (alloc.hasCoarraySpec())
-      TODO(loc, "coarray: allocation of a coarray object");
     if (alloc.type.IsPolymorphic())
       genSetType(alloc, box, loc);
     genSetDeferredLengthParameters(alloc, box);
     genAllocateObjectBounds(alloc, box);
     mlir::Value stat;
-    if (!isCudaAllocate) {
-      if (isAMDMemoryAllocatorEnabled)
-        genAMDRuntimeDescriptorSetAllocIdx(builder, loc, box, 1);
+    if (alloc.hasCoarraySpec()) {
+      stat = Fortran::lower::genAllocateCoarray(
+          converter, loc, alloc.getSymbol(), box.getAddr(),
+          alloc.getCoarraySpec(), errorManager.errMsgAddr);
+    } else if (!isCudaAllocate) {
+      if (isOpenMPAllocatorEnabled)
+        genOpenMPRuntimeDescriptorSetAllocIdx(builder, loc, box, 1);
       stat = genRuntimeAllocate(builder, loc, box, errorManager);
       setPinnedToFalse();
     } else {
@@ -681,8 +685,8 @@ private:
     unsigned allocatorIdx = Fortran::lower::getAllocatorIdx(alloc.getSymbol());
     fir::ExtendedValue exv = isSource ? sourceExv : moldExv;
     const auto &langFeatures = converter.getFoldingContext().languageFeatures();
-    bool isAMDMemoryAllocatorEnabled = langFeatures.IsEnabled(
-        Fortran::common::LanguageFeature::AmdMemoryAllocator);
+    bool isOpenMPAllocatorEnabled = langFeatures.IsEnabled(
+        Fortran::common::LanguageFeature::OpenMPDefaultAllocator);
 
     bool sourceIsDevice = false;
     if (const Fortran::semantics::Symbol *sym{GetLastSymbol(sourceExpr)})
@@ -692,8 +696,6 @@ private:
     // Generate a sequence of runtime calls.
     errorManager.genStatCheck(builder, loc);
     genAllocateObjectInit(box, allocatorIdx);
-    if (alloc.hasCoarraySpec())
-      TODO(loc, "coarray: allocation of a coarray object");
     // Set length of the allocate object if it has. Otherwise, get the length
     // from source for the deferred length parameter.
     const bool isDeferredLengthCharacter =
@@ -707,12 +709,17 @@ private:
       genSetDeferredLengthParameters(alloc, box);
     genAllocateObjectBounds(alloc, box);
     mlir::Value stat;
-    if (Fortran::semantics::HasCUDAAttr(alloc.getSymbol()) || sourceIsDevice) {
+    if (alloc.hasCoarraySpec()) {
+      stat = Fortran::lower::genAllocateCoarray(
+          converter, loc, alloc.getSymbol(), box.getAddr(),
+          alloc.getCoarraySpec(), errorManager.errMsgAddr);
+    } else if (Fortran::semantics::HasCUDAAttr(alloc.getSymbol()) ||
+               sourceIsDevice) {
       stat =
           genCudaAllocate(builder, loc, box, errorManager, alloc.getSymbol());
     } else {
-      if (isAMDMemoryAllocatorEnabled)
-        genAMDRuntimeDescriptorSetAllocIdx(builder, loc, box, 1);
+      if (isOpenMPAllocatorEnabled)
+        genOpenMPRuntimeDescriptorSetAllocIdx(builder, loc, box, 1);
       if (isSource)
         stat = genRuntimeAllocateSource(builder, loc, box, exv, errorManager);
       else
@@ -947,8 +954,10 @@ genDeallocate(fir::FirOpBuilder &builder,
       !box.isDerived() && !box.isPolymorphic() && !box.hasAssumedRank() &&
       !box.isUnlimitedPolymorphic() && !errorManager.hasStatSpec() &&
       !useAllocateRuntime && !box.isPointer();
+  bool isCoarraySymbol = symbol && Fortran::evaluate::IsCoarray(*symbol);
+
   // Deallocate intrinsic types inline.
-  if (inlineDeallocation &&
+  if (inlineDeallocation && !isCoarraySymbol &&
       ((isCudaSymbol && isCudaDeviceContext) || !isCudaSymbol)) {
     // Pointers must use PointerDeallocate so that their deallocations
     // can be validated.
@@ -961,7 +970,16 @@ genDeallocate(fir::FirOpBuilder &builder,
   // with its descriptor before and after calls if needed.
   errorManager.genStatCheck(builder, loc);
   mlir::Value stat;
-  if (!isCudaSymbol)
+  if (isCoarraySymbol) {
+    stat = errorManager.hasStatSpec()
+               ? builder.createTemporary(loc, builder.getI32Type())
+               : fir::AbsentOp::create(
+                     builder, loc, builder.getRefType(builder.getI32Type()));
+    mif::DeallocCoarrayOp::create(builder, loc, box.getAddr(), stat,
+                                  errorManager.errMsgAddr);
+    if (errorManager.hasStatSpec())
+      stat = fir::LoadOp::create(builder, loc, stat);
+  } else if (!isCudaSymbol)
     stat =
         genRuntimeDeallocate(builder, loc, box, errorManager, declaredTypeDesc);
   else

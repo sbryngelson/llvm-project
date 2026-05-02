@@ -123,6 +123,7 @@
 #include "llvm/Support/ModRef.h"
 #include "llvm/Support/TimeProfiler.h"
 #include "llvm/Support/raw_ostream.h"
+#include "llvm/Transforms/Coroutines/CoroInstr.h"
 #include <algorithm>
 #include <cassert>
 #include <cstdint>
@@ -800,6 +801,23 @@ void Verifier::visitGlobalValue(const GlobalValue &GV) {
           Check(Stripped != GO, "values should not reference themselves", GO,
                 MD);
         }
+      }
+    }
+
+    if (auto *Props = GO->getMetadata(LLVMContext::MD_elf_section_properties)) {
+      Check(Props->getNumOperands() == 2,
+            "elf_section_properties metadata must have two operands", GO,
+            Props);
+      if (Props->getNumOperands() == 2) {
+        auto *Type = dyn_cast<ConstantAsMetadata>(Props->getOperand(0));
+        Check(Type, "type field must be ConstantAsMetadata", GO, Props);
+        auto *TypeInt = dyn_cast<ConstantInt>(Type->getValue());
+        Check(TypeInt, "type field must be ConstantInt", GO, Props);
+
+        auto *Entsize = dyn_cast<ConstantAsMetadata>(Props->getOperand(1));
+        Check(Entsize, "entsize field must be ConstantAsMetadata", GO, Props);
+        auto *EntsizeInt = dyn_cast<ConstantInt>(Entsize->getValue());
+        Check(EntsizeInt, "entsize field must be ConstantInt", GO, Props);
       }
     }
   }
@@ -4671,9 +4689,10 @@ void Verifier::visitLoadInst(LoadInst &LI) {
               LI.getOrdering() != AtomicOrdering::AcquireRelease,
           "Load cannot have Release ordering", &LI);
     Check(ElTy->getScalarType()->isIntOrPtrTy() ||
+              ElTy->getScalarType()->isByteTy() ||
               ElTy->getScalarType()->isFloatingPointTy(),
-          "atomic load operand must have integer, pointer, floating point, "
-          "or vector type!",
+          "atomic load operand must have integer, byte, pointer, floating "
+          "point, or vector type!",
           ElTy, &LI);
 
     checkAtomicMemAccessSize(ElTy, &LI);
@@ -4699,9 +4718,10 @@ void Verifier::visitStoreInst(StoreInst &SI) {
               SI.getOrdering() != AtomicOrdering::AcquireRelease,
           "Store cannot have Acquire ordering", &SI);
     Check(ElTy->getScalarType()->isIntOrPtrTy() ||
+              ElTy->getScalarType()->isByteTy() ||
               ElTy->getScalarType()->isFloatingPointTy(),
-          "atomic store operand must have integer, pointer, floating point, "
-          "or vector type!",
+          "atomic store operand must have integer, byte, pointer, floating "
+          "point, or vector type!",
           ElTy, &SI);
     checkAtomicMemAccessSize(ElTy, &SI);
   } else {
@@ -5764,7 +5784,7 @@ void Verifier::visitInstruction(Instruction &I) {
   }
 
   if (MDNode *MD = I.getMetadata(LLVMContext::MD_fpmath)) {
-    Check(I.getType()->isFPOrFPVectorTy(),
+    Check(FPMathOperator::isSupportedFloatingPointType(I.getType()),
           "fpmath requires a floating point result!", &I);
     Check(MD->getNumOperands() == 1, "fpmath takes one operand!", &I);
     if (ConstantFP *CFP0 =
@@ -5926,38 +5946,20 @@ void Verifier::visitIntrinsicCall(Intrinsic::ID ID, CallBase &Call) {
   // Verify that the intrinsic prototype lines up with what the .td files
   // describe.
   FunctionType *IFTy = IF->getFunctionType();
-  bool IsVarArg = IFTy->isVarArg();
-
-  SmallVector<Intrinsic::IITDescriptor, 8> Table;
-  getIntrinsicInfoTableEntries(ID, Table);
-  ArrayRef<Intrinsic::IITDescriptor> TableRef = Table;
 
   // Walk the descriptors to extract overloaded types.
-  SmallVector<Type *, 4> ArgTys;
-  Intrinsic::MatchIntrinsicTypesResult Res =
-      Intrinsic::matchIntrinsicSignature(IFTy, TableRef, ArgTys);
-  Check(Res != Intrinsic::MatchIntrinsicTypes_NoMatchRet,
-        "Intrinsic has incorrect return type!", IF);
-  Check(Res != Intrinsic::MatchIntrinsicTypes_NoMatchArg,
-        "Intrinsic has incorrect argument type!", IF);
-
-  // Verify if the intrinsic call matches the vararg property.
-  if (IsVarArg)
-    Check(!Intrinsic::matchIntrinsicVarArg(IsVarArg, TableRef),
-          "Intrinsic was not defined with variable arguments!", IF);
-  else
-    Check(!Intrinsic::matchIntrinsicVarArg(IsVarArg, TableRef),
-          "Callsite was not defined with variable arguments!", IF);
-
-  // All descriptors should be absorbed by now.
-  Check(TableRef.empty(), "Intrinsic has too few arguments!", IF);
+  std::string ErrMsg;
+  raw_string_ostream ErrOS(ErrMsg);
+  SmallVector<Type *, 4> OverloadTys;
+  bool IsValid = Intrinsic::isSignatureValid(ID, IFTy, OverloadTys, ErrOS);
+  Check(IsValid, ErrMsg, IF);
 
   // Now that we have the intrinsic ID and the actual argument types (and we
   // know they are legal for the intrinsic!) get the intrinsic name through the
   // usual means.  This allows us to verify the mangling of argument types into
   // the name.
   const std::string ExpectedName =
-      Intrinsic::getName(ID, ArgTys, IF->getParent(), IFTy);
+      Intrinsic::getName(ID, OverloadTys, IF->getParent(), IFTy);
   Check(ExpectedName == IF->getName(),
         "Intrinsic name not mangled correctly for type arguments! "
         "Should be: " +
@@ -6060,10 +6062,29 @@ void Verifier::visitIntrinsicCall(Intrinsic::ID ID, CallBase &Call) {
     }
     break;
   }
+  case Intrinsic::coro_begin:
+  case Intrinsic::coro_begin_custom_abi:
+    Check(isa<AnyCoroIdInst>(Call.getArgOperand(0)),
+          "id argument of llvm.coro.begin must refer to coro.id");
+    break;
   case Intrinsic::coro_id: {
-    auto *InfoArg = Call.getArgOperand(3)->stripPointerCasts();
-    if (isa<ConstantPointerNull>(InfoArg))
+    Check(isa<ConstantInt>(Call.getArgOperand(0)),
+          "align argument only accepts constants");
+    auto *Promise = Call.getArgOperand(1);
+    Check(isa<ConstantPointerNull>(Promise) || isa<AllocaInst>(Promise),
+          "promise argument must refer to an alloca");
+
+    auto *CoroAddr = Call.getArgOperand(2)->stripPointerCasts();
+    bool BeforeCoroEarly = isa<ConstantPointerNull>(CoroAddr);
+    Check(BeforeCoroEarly || isa<Function>(CoroAddr),
+          "coro argument must refer to a function");
+
+    auto *InfoArg = Call.getArgOperand(3);
+    bool BeforeCoroSplit = isa<ConstantPointerNull>(InfoArg);
+    if (BeforeCoroSplit)
       break;
+
+    Check(!BeforeCoroEarly, "cannot run CoroSplit before CoroEarly");
     auto *GV = dyn_cast<GlobalVariable>(InfoArg);
     Check(GV && GV->isConstant() && GV->hasDefinitiveInitializer(),
           "info argument of llvm.coro.id must refer to an initialized "
@@ -6624,14 +6645,14 @@ void Verifier::visitIntrinsicCall(Intrinsic::ID ID, CallBase &Call) {
   case Intrinsic::vector_reduce_umin: {
     Type *ArgTy = Call.getArgOperand(0)->getType();
     Check(ArgTy->isIntOrIntVectorTy() && ArgTy->isVectorTy(),
-          "Intrinsic has incorrect argument type!");
+          "intrinsic has incorrect argument type!");
     break;
   }
   case Intrinsic::vector_reduce_fmax:
   case Intrinsic::vector_reduce_fmin: {
     Type *ArgTy = Call.getArgOperand(0)->getType();
     Check(ArgTy->isFPOrFPVectorTy() && ArgTy->isVectorTy(),
-          "Intrinsic has incorrect argument type!");
+          "intrinsic has incorrect argument type!");
     break;
   }
   case Intrinsic::vector_reduce_fadd:
@@ -6640,7 +6661,7 @@ void Verifier::visitIntrinsicCall(Intrinsic::ID ID, CallBase &Call) {
     // second argument is the vector to be reduced.
     Type *ArgTy = Call.getArgOperand(1)->getType();
     Check(ArgTy->isFPOrFPVectorTy() && ArgTy->isVectorTy(),
-          "Intrinsic has incorrect argument type!");
+          "intrinsic has incorrect argument type!");
     break;
   }
   case Intrinsic::smul_fix:
@@ -6952,25 +6973,6 @@ void Verifier::visitIntrinsicCall(Intrinsic::ID ID, CallBase &Call) {
           "write argument to llvm.aarch64.range.prefetch must be 0 or 1", Call);
     Check(cast<ConstantInt>(Call.getArgOperand(2))->getZExtValue() < 2,
           "stream argument to llvm.aarch64.range.prefetch must be 0 or 1",
-          Call);
-    break;
-  }
-  case Intrinsic::aarch64_stshh_atomic_store: {
-    uint64_t Order = cast<ConstantInt>(Call.getArgOperand(2))->getZExtValue();
-    Check(Order == static_cast<uint64_t>(AtomicOrderingCABI::relaxed) ||
-              Order == static_cast<uint64_t>(AtomicOrderingCABI::release) ||
-              Order == static_cast<uint64_t>(AtomicOrderingCABI::seq_cst),
-          "order argument to llvm.aarch64.stshh.atomic.store must be 0, 3 or 5",
-          Call);
-
-    Check(cast<ConstantInt>(Call.getArgOperand(3))->getZExtValue() < 2,
-          "policy argument to llvm.aarch64.stshh.atomic.store must be 0 or 1",
-          Call);
-
-    uint64_t Size = cast<ConstantInt>(Call.getArgOperand(4))->getZExtValue();
-    Check(Size == 8 || Size == 16 || Size == 32 || Size == 64,
-          "size argument to llvm.aarch64.stshh.atomic.store must be 8, 16, "
-          "32 or 64",
           Call);
     break;
   }
