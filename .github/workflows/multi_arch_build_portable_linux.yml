@@ -212,17 +212,43 @@ jobs:
         if: ${{ steps.stage_config.outputs.pip_install_cmd }}
         run: pip install ${{ steps.stage_config.outputs.pip_install_cmd }}
 
+      - name: Fix LLVM test variable mismatch
+        run: |
+          sed -i 's/THEROCK_ENABLE_LLVM_TESTS/THEROCK_BUILD_LLVM_TESTS/g' \
+            cmake/therock_subproject.cmake compiler/CMakeLists.txt
+
       - name: Configure
         run: |
           cmake -B build -S . -GNinja \
             -DTHEROCK_PACKAGE_VERSION=${{ inputs.rocm_package_version }} \
             -DCMAKE_C_COMPILER_LAUNCHER=ccache \
             -DCMAKE_CXX_COMPILER_LAUNCHER=ccache \
+            -DTHEROCK_BUILD_LLVM_TESTS=ON \
             ${{ steps.stage_config.outputs.cmake_args }}
 
       - name: Build stage
         run: |
           cmake --build build --target stage-${STAGE_NAME} therock-artifacts -- -k 0
+
+      - name: LLVM Lit Tests
+        run: |
+          ninja -C build/compiler/amd-llvm/build check-llvm
+
+      - name: Clang Lit Tests
+        run: |
+          ninja -C build/compiler/amd-llvm/build check-clang
+
+      - name: Flang Lit Tests
+        run: |
+          ninja -C build/compiler/amd-llvm/build check-flang
+
+      - name: MLIR Lit Tests
+        run: |
+          ninja -C build/compiler/amd-llvm/build check-mlir
+
+      - name: LLD Lit Tests
+        run: |
+          ninja -C build/compiler/amd-llvm/build check-lld
 
       - name: Report
         if: ${{ !cancelled() }}
